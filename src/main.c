@@ -15,44 +15,71 @@
 #endif
 #include <zephyr/device.h>
 #include <zephyr/net/net_config.h>
+#include <stdio.h>
 
-#ifdef CONFIG_SLIP
-/* Fixed address as the static IP given from Kconfig will be
- * applied to Wi-Fi interface.
- */
-#define CONFIG_NET_CONFIG_SLIP_IPV4_ADDR "192.0.2.1"
-#define CONFIG_NET_CONFIG_SLIP_IPV4_MASK "255.255.255.0"
-#endif /* CONFIG_SLIP */
+#if !defined(__ZEPHYR__) || defined(CONFIG_POSIX_API)
 
-#ifdef CONFIG_USB_DEVICE_STACK
-#include <zephyr/usb/usb_device.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
-/* Fixed address as the static IP given from Kconfig will be
- * applied to Wi-Fi interface.
- */
-#define CONFIG_NET_CONFIG_USB_IPV4_ADDR "192.0.2.1"
-#define CONFIG_NET_CONFIG_USB_IPV4_MASK "255.255.255.0"
+#else
 
-int init_usb(void)
-{
-	int ret;
+#include <zephyr/net/socket.h>
+#include <zephyr/kernel.h>
 
-	ret = usb_enable(NULL);
-	if (ret != 0) {
-		printk("Cannot enable USB (%d)", ret);
-		return ret;
-	}
+#include <zephyr/net/net_pkt.h>
 
-	return 0;
-}
 #endif
 
+#define BIND_PORT 8080
+
+#include <zephyr/drivers/video.h>
+#include <zephyr/drivers/video/arducam_mega.h>
+
+#define CHECK(r) { if (r == -1) { printf("Error: " #r "\n"); exit(1); } }
+
+const struct device *video;
+struct video_buffer *vbuf;
+static struct arducam_mega_info mega_info;
+
+const char JHEADER[] = "HTTP/1.1 200 OK\r\n" \
+                       "Content-disposition: inline; filename=capture.jpg\r\n" \
+                       "Content-type: image/jpeg\r\n\r\n";
+
+const char HEADER[] = "HTTP/1.1 200 OK\r\n" \
+                      "Access-Control-Allow-Origin: *\r\n" \
+                      "Content-Type: multipart/x-mixed-replace; boundary=123456789000000000000987654321\r\n";
+const char BOUNDARY[] = "\r\n--123456789000000000000987654321\r\n";
+const char CTNTTYPE[] = "Content-Type: image/jpeg\r\nContent-Length: ";
+
+
+uint8_t img_buffer[40000];
+uint32_t img_buffer_size;
+void get_image(void) {
+	uint32_t timestamp;
+	uint32_t cursor;
+
+
+	video_dequeue(video, VIDEO_EP_OUT, &vbuf, K_FOREVER);
+	//mark down the current timestamp, and start recording when next frame comes
+	timestamp = vbuf->timestamp;
+	img_buffer_size = vbuf->bytesframe;
+	cursor = 0;
+	memcpy(img_buffer+cursor, vbuf->buffer, vbuf->bytesused);
+	cursor += vbuf->bytesused;
+	video_enqueue(video, VIDEO_EP_OUT, vbuf);
+	while (cursor < img_buffer_size) {
+		video_dequeue(video, VIDEO_EP_OUT, &vbuf, K_FOREVER);
+		memcpy(img_buffer+cursor, vbuf->buffer, vbuf->bytesused);
+		cursor += vbuf->bytesused;
+		video_enqueue(video, VIDEO_EP_OUT, vbuf);
+	}
+}
 
 int main(void)
 {
-#if defined(CONFIG_USB_DEVICE_STACK) || defined(CONFIG_SLIP)
-	struct in_addr addr;
-#endif
 
 #if defined(CLOCK_FEATURE_HFCLK_DIVIDE_PRESENT) || NRF_CLOCK_HAS_HFCLK192M
 	/* For now hardcode to 128MHz */
@@ -61,76 +88,228 @@ int main(void)
 #endif
 	printk("Starting %s with CPU frequency: %d MHz\n", CONFIG_BOARD, SystemCoreClock/MHZ(1));
 
-#ifdef CONFIG_USB_DEVICE_STACK
-	init_usb();
 
-	/* Redirect static IP address to netusb*/
-	const struct device *usb_dev = device_get_binding("eth_netusb");
-	struct net_if *iface = net_if_lookup_by_dev(usb_dev);
 
-	if (!iface) {
-		printk("Cannot find network interface: %s", "eth_netusb");
-		return -1;
-	}
-	if (sizeof(CONFIG_NET_CONFIG_USB_IPV4_ADDR) > 1) {
-		if (net_addr_pton(AF_INET, CONFIG_NET_CONFIG_USB_IPV4_ADDR, &addr)) {
-			printk("Invalid address: %s", CONFIG_NET_CONFIG_USB_IPV4_ADDR);
-			return -1;
-		}
-		net_if_ipv4_addr_add(iface, &addr, NET_ADDR_MANUAL, 0);
-	}
+	int ret;
+	struct video_buffer *buffers[3];
 
-	if (sizeof(CONFIG_NET_CONFIG_USB_IPV4_MASK) > 1) {
-		/* If not empty */
-		if (net_addr_pton(AF_INET, CONFIG_NET_CONFIG_USB_IPV4_MASK, &addr)) {
-			printk("Invalid netmask: %s", CONFIG_NET_CONFIG_USB_IPV4_MASK);
-		} else {
-			net_if_ipv4_set_netmask(iface, &addr);
-		}
-	}
-#endif
+	video = DEVICE_DT_GET(DT_NODELABEL(arducam_mega0));
 
-#ifdef CONFIG_SLIP
-	const struct device *slip_dev = device_get_binding(CONFIG_SLIP_DRV_NAME);
-	struct net_if *slip_iface = net_if_lookup_by_dev(slip_dev);
-
-	if (!slip_iface) {
-		printk("Cannot find network interface: %s", CONFIG_SLIP_DRV_NAME);
+	if (!device_is_ready(video))
+	{
+		printk("Video device %s not ready.", video->name);
 		return -1;
 	}
 
-	if (sizeof(CONFIG_NET_CONFIG_SLIP_IPV4_ADDR) > 1) {
-		if (net_addr_pton(AF_INET, CONFIG_NET_CONFIG_SLIP_IPV4_ADDR, &addr)) {
-			printk("Invalid address: %s", CONFIG_NET_CONFIG_SLIP_IPV4_ADDR);
+	video_stream_stop(video);
+	printk("Device %s is ready!", video->name);
+	k_msleep(100);
+	video_get_ctrl(video, VIDEO_CID_ARDUCAM_INFO, &mega_info);
+	struct video_format format;
+	format.height = 480;
+	format.width = 640;
+	format.pixelformat = VIDEO_PIX_FMT_JPEG;
+	video_set_format(video, VIDEO_EP_ANY, &format);
+	for (int i = 0; i < ARRAY_SIZE(buffers); i++)
+	{
+		buffers[i] = video_buffer_alloc(4096);
+		if (buffers[i] == NULL)
+		{
+			printk("Unable to alloc video buffer");
 			return -1;
 		}
-		net_if_ipv4_addr_add(slip_iface, &addr, NET_ADDR_MANUAL, 0);
+		video_enqueue(video, VIDEO_EP_OUT, buffers[i]);
 	}
+	video_stream_start(video);
 
-	if (sizeof(CONFIG_NET_CONFIG_SLIP_IPV4_MASK) > 1) {
-		/* If not empty */
-		if (net_addr_pton(AF_INET, CONFIG_NET_CONFIG_SLIP_IPV4_MASK, &addr)) {
-			printk("Invalid netmask: %s", CONFIG_NET_CONFIG_SLIP_IPV4_MASK);
-		} else {
-			net_if_ipv4_set_netmask(slip_iface, &addr);
+
+
+	int serv;
+	struct sockaddr_in bind_addr;
+	static int counter;
+
+	serv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	CHECK(serv);
+
+	bind_addr.sin_family = AF_INET;
+	bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	bind_addr.sin_port = htons(BIND_PORT);
+	CHECK(bind(serv, (struct sockaddr *)&bind_addr, sizeof(bind_addr)));
+
+	CHECK(listen(serv, 5));
+
+	printf("Single-threaded dumb HTTP server waits for a connection on "
+	       "port %d...\n", BIND_PORT);
+
+	while (1) {
+		struct sockaddr_in client_addr;
+		socklen_t client_addr_len = sizeof(client_addr);
+		char addr_str[32];
+		int req_state = 0;
+		const char *data;
+		size_t len;
+
+		int client = accept(serv, (struct sockaddr *)&client_addr,
+				    &client_addr_len);
+		if (client < 0) {
+			printf("Error in accept: %d - continuing\n", errno);
+			continue;
 		}
-	}
-#endif /* CONFIG_SLIP */
 
-#ifdef CONFIG_NET_CONFIG_SETTINGS
-	/* Without this, DHCPv4 starts on first interface and if that is not Wi-Fi or
-	 * only supports IPv6, then its an issue. (E.g., OpenThread)
-	 *
-	 * So, we start DHCPv4 on Wi-Fi interface always, independent of the ordering.
-	 */
-	const struct device *dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_wifi));
-	struct net_if *wifi_iface = net_if_lookup_by_dev(dev);
+		inet_ntop(client_addr.sin_family, &client_addr.sin_addr,
+			  addr_str, sizeof(addr_str));
+		printf("Connection #%d from %s\n", counter++, addr_str);
 
-	/* As both are Ethernet, we need to set specific interface*/
-	net_if_set_default(wifi_iface);
+		/* Discard HTTP request (or otherwise client will get
+		 * connection reset error).
+		 */
+		while (1) {
+			ssize_t r;
+			char c;
 
-	net_config_init_app(dev, "Initializing network");
+			r = recv(client, &c, 1, 0);
+			if (r == 0) {
+				goto close_client;
+			}
+
+			if (r < 0) {
+				if (errno == EAGAIN || errno == EINTR) {
+					continue;
+				}
+
+				printf("Got error %d when receiving from "
+				       "socket\n", errno);
+				goto close_client;
+			}
+			if (req_state == 0 && c == '\r') {
+				req_state++;
+			} else if (req_state == 1 && c == '\n') {
+				req_state++;
+			} else if (req_state == 2 && c == '\r') {
+				req_state++;
+			} else if (req_state == 3 && c == '\n') {
+				break;
+			} else {
+				req_state = 0;
+			}
+		}
+		/* HTTP Header */
+		data = HEADER;
+		len = strlen(HEADER);
+		while (len) {
+			int sent_len = send(client, data, len, 0);
+
+			if (sent_len == -1) {
+				printf("Error sending data to peer, errno: %d\n", errno);
+				break;
+			}
+			data += sent_len;
+			len -= sent_len;
+		}
+		/* HTTP boundary */
+		data = BOUNDARY;
+		len = strlen(BOUNDARY);
+		while (len) {
+			int sent_len = send(client, data, len, 0);
+
+			if (sent_len == -1) {
+				printf("Error sending data to peer, errno: %d\n", errno);
+				break;
+			}
+			data += sent_len;
+			len -= sent_len;
+		}
+
+		/* Keep sending images */
+		uint64_t t_start, t_end;
+		while (1) {
+
+			get_image();
+
+			t_start = k_uptime_get();
+
+
+			/* HTTP content type */
+			data = CTNTTYPE;
+			len = strlen(CTNTTYPE);
+			while (len) {
+				int sent_len = send(client, data, len, 0);
+
+				if (sent_len == -1) {
+					printf("Error sending data to peer, errno: %d\n", errno);
+					goto close_client;
+				}
+				data += sent_len;
+				len -= sent_len;
+			}
+			/* Image size */
+			char buf[20];
+			sprintf(buf, "%d\r\n\r\n", img_buffer_size);
+
+			data = buf;
+			len = strlen(buf);
+			while (len) {
+				int sent_len = send(client, data, len, 0);
+
+				if (sent_len == -1) {
+					printf("Error sending data to peer, errno: %d\n", errno);
+					goto close_client;
+				}
+				data += sent_len;
+				len -= sent_len;
+			}
+			/* message body containing img bytes */
+			data = img_buffer;
+			len = img_buffer_size;
+			while (len) {
+				int sent_len = send(client, data, len, 0);
+
+				if (sent_len == -1) {
+					printf("Error sending data to peer, errno: %d\n", errno);
+					goto close_client;
+				}
+				data += sent_len;
+				len -= sent_len;
+			}
+			/* HTTP boundary */
+			data = BOUNDARY;
+			len = strlen(BOUNDARY);
+			while (len) {
+				int sent_len = send(client, data, len, 0);
+
+				if (sent_len == -1) {
+					printf("Error sending data to peer, errno: %d\n", errno);
+					goto close_client;
+				}
+				data += sent_len;
+				len -= sent_len;
+			}
+			t_end = k_uptime_get();
+			printk("Transmission %lld ms.\n", t_end - t_start);
+			k_msleep(10);
+
+		}
+
+
+close_client:
+		ret = close(client);
+		if (ret == 0) {
+			printf("Connection from %s closed\n", addr_str);
+		} else {
+			printf("Got error %d while closing the "
+			       "socket\n", errno);
+		}
+
+#if defined(__ZEPHYR__) && defined(CONFIG_NET_BUF_POOL_USAGE)
+		struct k_mem_slab *rx, *tx;
+		struct net_buf_pool *rx_data, *tx_data;
+
+		net_pkt_get_info(&rx, &tx, &rx_data, &tx_data);
+		printf("rx buf: %d, tx buf: %d\n",
+		       atomic_get(&rx_data->avail_count), atomic_get(&tx_data->avail_count));
 #endif
+
+	}
 
 	return 0;
 }
